@@ -221,14 +221,49 @@ const toSandbox = (screen: KubiScreen, conn: { apiKey: string; baseUrl: string }
   screen, ...conn, timeout,
 });
 
+/** A Kubi template: a saved disk that new screens start from. */
+export interface KubiTemplate {
+  id: string;
+  name: string;
+  state: string;
+  source_screen_id?: string | null;
+  size_bytes?: number | null;
+  created_at: string;
+  [key: string]: unknown;
+}
+
+/** Waits for an operation (stop, start, template save) to finish. */
+async function waitOperation(conn: { apiKey: string; baseUrl: string }, operationId: string, what: string): Promise<void> {
+  const deadline = Date.now() + 15 * 60_000;
+  for (;;) {
+    const op = await call<{ status: string; error?: { code?: string; message?: string } | null }>(
+      conn, 'GET', `/operations/${operationId}`, { query: { wait_s: WAIT_S } },
+    );
+    if (op.status === 'failed') throw new Error(`Kubi could not ${what}: ${op.error?.code ?? ''} ${op.error?.message ?? ''}`.trim());
+    if (['succeeded', 'done', 'completed'].includes(op.status)) return;
+    if (Date.now() > deadline) throw new Error(`Kubi did not ${what} within 15 minutes`);
+  }
+}
+
+const toSnapshot = (t: KubiTemplate) => ({
+  id: t.id,
+  provider: 'kubi',
+  createdAt: new Date(t.created_at),
+  metadata: { name: t.name, state: t.state, sourceScreenId: t.source_screen_id ?? undefined, sizeBytes: t.size_bytes ?? undefined },
+});
+
 export const kubi = defineProvider<KubiSandbox, KubiConfig>({
   name: 'kubi',
+  // One size: 4 vCPU, 8 GiB, a 50 GB disk.
+  sizes: (_config, profile) =>
+    profile.vcpus === 4 && profile.memoryMiB === 8192
+      ? { status: 'supported', nativeOptions: {}, resolved: { vcpus: 4, memoryMiB: 8192, diskMiB: 47_683 } }
+      : { status: 'unsupported', reason: 'Kubi has one size: 4 vCPU, 8 GiB, a 50 GB disk.' },
   methods: {
     instances: {
       create: async (config: KubiConfig, options?: CreateInstanceOptions) => {
         const conn = connection(config);
         const timeout = options?.timeout ?? config.timeout ?? DEFAULT_TIMEOUT_MS;
-        if (options?.snapshotId) throw new Error('Kubi does not restore snapshots through ComputeSDK yet');
         const labels: Record<string, string> = {};
         for (const [k, v] of Object.entries(options?.metadata ?? {})) {
           if (/^[A-Za-z0-9_./-]{1,63}$/.test(k) && v !== undefined && v !== null) labels[k] = String(v).slice(0, 255);
@@ -240,7 +275,7 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
             kind: 'disposable',
             ends_in_s: lifetimeSeconds(timeout),
             ...(name && { name }),
-            ...(options?.templateId && { template_id: options.templateId }),
+            ...((options?.snapshotId ?? options?.templateId) && { template_id: options?.snapshotId ?? options?.templateId }),
             ...(Object.keys(labels).length && { labels }),
           },
         });
@@ -325,6 +360,24 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
         return options.protocol === 'wss' || options.protocol === 'ws' ? url.replace(/^https:/, 'wss:') : url;
       },
 
+      getInstance: (sandbox: KubiSandbox): KubiSandbox => sandbox,
+
+      // Stop and start: the disk survives, running processes do not.
+      pause: async (sandbox: KubiSandbox): Promise<void> => {
+        const op = await call<{ id: string }>(sandbox, 'POST', `/screens/${sandbox.screen.id}/stop`, {
+          key: `computesdk-stop-${crypto.randomUUID()}`,
+        });
+        await waitOperation(sandbox, op.id, 'stop the screen');
+      },
+      resume: async (sandbox: KubiSandbox): Promise<void> => {
+        const op = await call<{ id: string }>(sandbox, 'POST', `/screens/${sandbox.screen.id}/start`, {
+          key: `computesdk-start-${crypto.randomUUID()}`,
+        });
+        await waitOperation(sandbox, op.id, 'start the screen');
+        sandbox.screen = await waitRunning(sandbox, sandbox.screen.id);
+      },
+      pauseCapabilities: { memory: false },
+
       filesystem: {
         readFile: async (sandbox: KubiSandbox, path: string): Promise<string> =>
           call<string>(sandbox, 'GET', `/screens/${sandbox.screen.id}/files`, { query: { path } }),
@@ -366,5 +419,50 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
         },
       },
     },
+
+    // A snapshot is a Kubi template: the screen's disk, saved; new screens start from it with snapshotId.
+    snapshot: {
+      capabilities: { scope: 'rootfs', memory: false, destroysSource: false },
+      create: async (config: KubiConfig, sandboxId: string, options?: { name?: string }) => {
+        const conn = connection(config);
+        const name = (options?.name ?? `snapshot-${Date.now()}`).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 63) || `snapshot-${Date.now()}`;
+        const op = await call<{ id: string; template_id: string }>(conn, 'POST', '/templates', {
+          key: `computesdk-snapshot-${crypto.randomUUID()}`,
+          body: { screen_id: sandboxId, name },
+        });
+        await waitOperation(conn, op.id, 'save the snapshot');
+        return toSnapshot(await call<KubiTemplate>(conn, 'GET', `/templates/${op.template_id}`));
+      },
+      list: async (config: KubiConfig) => (await listTemplates(config)).map(toSnapshot),
+      delete: async (config: KubiConfig, snapshotId: string) => deleteTemplate(config, snapshotId),
+    },
+
+    template: {
+      create: async () => {
+        throw new Error('Kubi saves a template from a running screen: use snapshot.create(sandboxId), then create({ templateId })');
+      },
+      list: async (config: KubiConfig) => listTemplates(config),
+      delete: async (config: KubiConfig, templateId: string) => deleteTemplate(config, templateId),
+    },
   },
 });
+
+async function listTemplates(config: KubiConfig): Promise<KubiTemplate[]> {
+  const conn = connection(config);
+  const out: KubiTemplate[] = [];
+  let after: string | undefined;
+  do {
+    const page = await call<{ data: KubiTemplate[]; next: string | null }>(conn, 'GET', '/templates', { query: { limit: 100, after } });
+    out.push(...page.data);
+    after = page.next ?? undefined;
+  } while (after);
+  return out;
+}
+
+async function deleteTemplate(config: KubiConfig, templateId: string): Promise<void> {
+  try {
+    await call(connection(config), 'DELETE', `/templates/${templateId}`, { key: `computesdk-template-delete-${templateId}` });
+  } catch (e) {
+    if (!isNotFound(e)) throw e;
+  }
+}
