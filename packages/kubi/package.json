@@ -45,7 +45,7 @@
     "url": "https://github.com/computesdk/computesdk.git",
     "directory": "packages/kubi"
   },
-  "homepage": "https://github.com/computesdk/computesdk/tree/main/packages/e2b#readme",
+  "homepage": "https://github.com/computesdk/computesdk/tree/main/packages/kubi#readme",
   "bugs": {
     "url": "https://github.com/computesdk/computesdk/issues"
   },

@@ -120,10 +120,13 @@ async function call<T>(
       return (type.includes('json') ? await res.json() : await res.text()) as T;
     }
     const err = ((await res.json().catch(() => ({}))) as { error?: Record<string, any> }).error ?? {};
-    const error = new KubiError(res.status, err.code ?? 'HTTP_ERROR', err.message ?? res.statusText, err.retry_after);
-    // Only what Kubi marks retryable is sent again: a rate limit, or a host with no room right now.
-    if (err.retryable === true && attempt < 3 && (init.key || method === 'GET')) {
-      await new Promise((r) => setTimeout(r, Math.min(10, Number(err.retry_after) || 1) * 1000));
+    const retryAfter = Number(err.retry_after ?? res.headers.get('retry-after')) || 1;
+    const error = new KubiError(res.status, err.code ?? 'HTTP_ERROR', err.message ?? res.statusText, retryAfter);
+    // Sent again only when Kubi marks it retryable (never a 504), or NO_CAPACITY: nothing was made and no key was
+    // stored, so the same Idempotency-Key is safe. Either way only GETs and keyed calls, so nothing runs twice.
+    const again = err.retryable === true || err.code === 'NO_CAPACITY';
+    if (again && res.status !== 504 && attempt < 5 && (init.key || method === 'GET')) {
+      await new Promise((r) => setTimeout(r, Math.min(30, retryAfter) * 1000));
       continue;
     }
     throw error;
@@ -180,10 +183,11 @@ async function runCommand(sandbox: KubiSandbox, command: string, options?: RunCo
   let full = `[ -f ${ENV_FILE} ] && . ${ENV_FILE}; ${callEnv}${command}`;
   if (options?.background) full = `nohup sh -c ${quote(full)} > /dev/null 2>&1 &`;
   let exec = await call<KubiExec>(sandbox, 'POST', `/screens/${sandbox.screen.id}/exec`, {
+    key: `computesdk-exec-${crypto.randomUUID()}`,
     body: {
       command: full,
       ...(options?.cwd && { cwd: options.cwd }),
-      timeout_s: options?.timeout ? Math.max(1, Math.ceil(options.timeout / 1000)) : 0,
+      timeout_s: options?.timeout ? Math.min(86_400, Math.max(1, Math.ceil(options.timeout / 1000))) : 0,
       wait_s: WAIT_S,
       max_bytes: PAGE_BYTES,
     },
@@ -229,17 +233,25 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
         for (const [k, v] of Object.entries(options?.metadata ?? {})) {
           if (/^[A-Za-z0-9_./-]{1,63}$/.test(k) && v !== undefined && v !== null) labels[k] = String(v).slice(0, 255);
         }
+        const name = options?.name?.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 63);
         const op = await call<{ id: string; screen_id: string }>(conn, 'POST', '/screens', {
           key: `computesdk-${crypto.randomUUID()}`,
           body: {
             kind: 'disposable',
             ends_in_s: lifetimeSeconds(timeout),
-            ...(options?.name && { name: options.name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+/, '').slice(0, 63) }),
+            ...(name && { name }),
             ...(options?.templateId && { template_id: options.templateId }),
             ...(Object.keys(labels).length && { labels }),
           },
         });
-        const screen = await waitRunning(conn, op.screen_id, op.id);
+        let screen: KubiScreen;
+        try {
+          screen = await waitRunning(conn, op.screen_id, op.id);
+        } catch (e) {
+          // It would end at its end time anyway; deleting it now stops the charge.
+          await call(conn, 'DELETE', `/screens/${op.screen_id}`, { key: `computesdk-destroy-${op.screen_id}` }).catch(() => {});
+          throw e;
+        }
         const sandbox = toSandbox(screen, conn, timeout);
         if (options?.envs && Object.keys(options.envs).length) {
           // Kubi has no per-screen environment for commands: the variables go into a file each command sources.
@@ -290,7 +302,7 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
           if (isNotFound(e)) return { ...sandbox.screen, state: 'deleted' };
           throw e;
         });
-        const status = ['running', 'provisioning', 'starting', 'restarting'].includes(screen.state)
+        const status = ['running', 'provisioning', 'starting', 'restarting', 'waiting'].includes(screen.state)
           ? 'running'
           : ['stopping', 'stopped'].includes(screen.state) ? 'stopped' : 'error';
         return {
@@ -309,7 +321,8 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
           body: { access: 'link' },
         });
         const url = port.url.replace(/\/+$/, '');
-        return options.protocol && options.protocol !== 'https' ? url.replace(/^https:/, `${options.protocol}:`) : url;
+        // The port relay serves HTTPS and WSS only.
+        return options.protocol === 'wss' || options.protocol === 'ws' ? url.replace(/^https:/, 'wss:') : url;
       },
 
       filesystem: {
