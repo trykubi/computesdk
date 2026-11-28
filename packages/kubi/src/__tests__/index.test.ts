@@ -6,6 +6,11 @@ runProviderTestSuite({
   provider: kubi({}),
   // Files go through Kubi's own files API; folders, existence and removal through commands.
   supportsFilesystem: true,
+  // Exec polled by offset: output arrives as it is printed, kill ends it; no stdin.
+  supportsProcesses: true,
+  // Stop and start keep the disk; snapshots are templates (the disk, no memory).
+  supportsPauseResume: true,
+  supportsSnapshots: true,
   skipIntegration: !process.env.KUBI_API_KEY,
   // getUrl opens a port, which needs a key with the `network` permission.
   supportsGetUrl: process.env.KUBI_TEST_PORTS === '1',

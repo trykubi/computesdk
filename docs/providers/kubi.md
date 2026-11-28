@@ -86,3 +86,11 @@ interface KubiConfig {
 - **Ports:** `getUrl({ port })` opens one of the screen's 3 ports and returns its HTTPS URL.
 - **Environment:** `envs` at create are sourced before every command; a command's own `env` wins.
 - **Size and region:** one size (4 vCPU, 8 GB, 50 GB), in France.
+
+## Snapshots, templates, pause and processes
+
+- **Snapshots** are Kubi templates: `snapshot.create(sandboxId)` saves the screen's disk (not its memory); `create({ snapshotId })` starts new screens from it. Saving takes about a minute and a half for a few GB today.
+- **Templates:** `template.list` and `template.delete`; a template is saved with `snapshot.create`.
+- **Pause and resume** stop and start the screen: the disk survives, running processes do not.
+- **Background processes:** `startProcess` streams output as it arrives and `kill` ends it; no stdin.
+- **Size:** `sizeClass: 'lg'` (4 vCPU, 8 GiB) is the one size; other sizes are unsupported.
