@@ -13,10 +13,7 @@ import type {
   CreateInstanceOptions,
   FileEntry,
   InstanceInfo,
-  ProcessHandle,
-  ProcessStatus,
   RunCommandOptions,
-  StartProcessOptions,
 } from '@computesdk/provider';
 
 export interface KubiConfig {
@@ -113,11 +110,21 @@ async function call<T>(
   // Kubi keeps an Idempotency-Key, so a create or delete resent after a lost reply never runs twice.
   if (init.key) headers['Idempotency-Key'] = init.key;
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, {
-      method,
-      headers,
-      body: init.raw ?? (init.body !== undefined ? JSON.stringify(init.body) : undefined),
-    });
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        method,
+        headers,
+        body: init.raw ?? (init.body !== undefined ? JSON.stringify(init.body) : undefined),
+      });
+    } catch (err) {
+      // A dropped connection: only a GET or a keyed call is sent again, so nothing runs twice.
+      if (attempt < 4 && (init.key || method === 'GET')) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+        continue;
+      }
+      throw err;
+    }
     if (res.ok) {
       const type = res.headers.get('content-type') ?? '';
       return (type.includes('json') ? await res.json() : await res.text()) as T;
@@ -218,70 +225,6 @@ async function runCommand(sandbox: KubiSandbox, command: string, options?: RunCo
 }
 
 const ENV_FILE = '/home/user/.config/computesdk/env.sh';
-
-/** A background command: Kubi exec, its output read by offset as it arrives, ended with exec kill. */
-async function startProcess(sandbox: KubiSandbox, command: string, options: StartProcessOptions = {}): Promise<ProcessHandle> {
-  if (options.stdin) throw new Error('Kubi processes take no stdin');
-  const started = Date.now();
-  const callEnv = Object.entries(options.env ?? {}).map(([k, v]) => `export ${k}=${quote(v)}; `).join('');
-  const base = `/screens/${sandbox.screen.id}/exec`;
-  const first = await call<KubiExec>(sandbox, 'POST', base, {
-    key: `computesdk-exec-${crypto.randomUUID()}`,
-    body: { command: `[ -f ${ENV_FILE} ] && . ${ENV_FILE}; ${callEnv}${command}`, ...(options.cwd && { cwd: options.cwd }), timeout_s: 0, wait_s: 0, max_bytes: PAGE_BYTES },
-  });
-  let last = first;
-  let stdout = first.stdout;
-  let stderr = first.stderr;
-  let outFrom = first.stdout_next ?? stdout.length;
-  let errFrom = first.stderr_next ?? stderr.length;
-  if (stdout) options.onStdout?.(stdout);
-  if (stderr) options.onStderr?.(stderr);
-  const ended = (e: KubiExec) => e.status !== 'running';
-  const poll = async (waitS: number) => {
-    const e = await call<KubiExec>(sandbox, 'GET', `${base}/${first.id}`, {
-      query: { wait_s: waitS, until: 'output', max_bytes: PAGE_BYTES, stdout_from: outFrom, stderr_from: errFrom },
-    });
-    if (e.stdout) { stdout += e.stdout; options.onStdout?.(e.stdout); }
-    if (e.stderr) { stderr += e.stderr; options.onStderr?.(e.stderr); }
-    outFrom = e.stdout_next ?? outFrom;
-    errFrom = e.stderr_next ?? errFrom;
-    last = e;
-    return e;
-  };
-  const exitCode = (e: KubiExec) => e.exit_code ?? (e.status === 'running' ? null : e.status === 'timed_out' ? 124 : 137);
-  let done: Promise<KubiExec> | undefined;
-  const untilExit = () => (done ??= (async () => {
-    let e = last;
-    while (!ended(e) || outFrom < e.stdout_bytes || errFrom < e.stderr_bytes) e = await poll(ended(e) ? 0 : WAIT_S);
-    options.onExit?.({ exitCode: exitCode(e), signal: e.signal ?? null });
-    return e;
-  })());
-  // Output is pushed to onStdout/onStderr as it arrives, as with providers that stream.
-  if (options.onStdout || options.onStderr || options.onExit) void untilExit().catch(() => {});
-  return {
-    pid: null,
-    jobId: first.id,
-    write: async () => { throw new Error('Kubi processes take no stdin'); },
-    closeStdin: async () => { throw new Error('Kubi processes take no stdin'); },
-    status: async (): Promise<ProcessStatus> => {
-      if (!done) await poll(0);
-      return { status: ended(last) ? 'exited' : 'running', exitCode: exitCode(last), signal: last.signal ?? null, stdout, stderr, truncated: !!last.output_dropped };
-    },
-    wait: async (opts?: { timeout?: number }) => {
-      const e = await (opts?.timeout
-        ? Promise.race([untilExit(), new Promise<never>((_, no) => setTimeout(() => no(new Error(`process ${first.id} still running after ${opts.timeout} ms`)), opts.timeout))])
-        : untilExit());
-      return { stdout, stderr, exitCode: exitCode(e) ?? 0, durationMs: Date.now() - started, signal: e.signal ?? null };
-    },
-    kill: async (signal?: string) => {
-      try {
-        await call(sandbox, 'POST', `${base}/${first.id}/kill`, { body: { signal: (signal ?? 'TERM').replace(/^SIG/, '') } });
-      } catch (e) {
-        if (!(e instanceof KubiError && (e.status === 404 || e.status === 409))) throw e;
-      }
-    },
-  };
-}
 const quote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 const toSandbox = (screen: KubiScreen, conn: { apiKey: string; baseUrl: string }, timeout: number): KubiSandbox => ({
@@ -398,8 +341,6 @@ export const kubi = defineProvider<KubiSandbox, KubiConfig>({
       },
 
       runCommand: (sandbox: KubiSandbox, command: string, options?: RunCommandOptions) => runCommand(sandbox, command, options),
-
-      startProcess: (sandbox: KubiSandbox, command: string, options: StartProcessOptions) => startProcess(sandbox, command, options),
 
       getInfo: async (sandbox: KubiSandbox): Promise<InstanceInfo> => {
         const screen = await call<KubiScreen>(sandbox, 'GET', `/screens/${sandbox.screen.id}`).catch((e) => {

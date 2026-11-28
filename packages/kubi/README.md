@@ -82,5 +82,5 @@ a command's own `env` wins over them. Commands run as the desktop user `user` (p
 - **Snapshots** are Kubi templates: `snapshot.create(sandboxId)` saves the screen's disk (not its memory); `create({ snapshotId })` starts new screens from it. Saving takes about a minute and a half for a few GB today.
 - **Templates:** `template.list` and `template.delete`; a template is saved with `snapshot.create`.
 - **Pause and resume** stop and start the screen: the disk survives, running processes do not.
-- **Background processes:** `startProcess` streams output as it arrives and `kill` ends it; no stdin.
+- **Background processes:** `startProcess` runs on ComputeSDK's shell tier over `runCommand`: stdin, kill, parallel starts and reattach.
 - **Size:** `sizeClass: 'lg'` (4 vCPU, 8 GiB) is the one size; other sizes are unsupported.

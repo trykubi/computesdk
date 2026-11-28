@@ -6,7 +6,7 @@ runProviderTestSuite({
   provider: kubi({}),
   // Files go through Kubi's own files API; folders, existence and removal through commands.
   supportsFilesystem: true,
-  // Exec polled by offset: output arrives as it is printed, kill ends it; no stdin.
+  // ComputeSDK's shell tier over runCommand: stdin, kill, parallel starts, reattach.
   supportsProcesses: true,
   // Stop and start keep the disk; snapshots are templates (the disk, no memory).
   supportsPauseResume: true,
